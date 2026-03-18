@@ -9,7 +9,6 @@ st.set_page_config(page_title="Monitorização DOEMS", page_icon="🔍", layout=
 
 @st.cache_data
 def extract_text_from_pdf(file_bytes):
-    """Extrai todo o texto do PDF e retorna o texto e a contagem de páginas."""
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
         text = ""
@@ -23,14 +22,10 @@ def extract_text_from_pdf(file_bytes):
         return None, str(e)
 
 def processar_publicacao(texto_completo, nome_busca):
-    """Faz a busca reversa: acha o nome, o cabeçalho, o contexto (incluindo a acção) e os dados da tabela."""
     nome_formatado = r"\s+".join(nome_busca.strip().split())
     regex_nome = re.compile(nome_formatado, re.IGNORECASE)
     
-    # Cabeçalhos típicos
     regex_cabecalho = re.compile(r"(?i)(?:^|\n)\s*(PORTARIA|DECRETO|RESOLUÇÃO|EDITAL|ATO|EXTRATO)[^\n]+")
-    
-    # Padrão para encontrar onde o preâmbulo termina (ex: resolve:, decreta:)
     regex_acao = re.compile(r"(?i)(RESOLVE|RESOLVEM|DECIDE|DECRETA|TORNA PÚBLICO|CONVOCA|DESIGNAR|NOMEAR|EXONERAR|AUTORIZAR|CERTIFICA)[^\n]*?(?::|;|\n|$)")
 
     resultados = []
@@ -38,7 +33,6 @@ def processar_publicacao(texto_completo, nome_busca):
     for match_nome in regex_nome.finditer(texto_completo):
         pos_nome_inicio = match_nome.start()
         
-        # 1. Procurar o cabeçalho mais próximo para trás
         texto_para_tras = texto_completo[:pos_nome_inicio]
         cabecalhos = list(regex_cabecalho.finditer(texto_para_tras))
         
@@ -49,44 +43,65 @@ def processar_publicacao(texto_completo, nome_busca):
         cabecalho_texto = ultimo_cabecalho.group().strip()
         pos_cabecalho = ultimo_cabecalho.start()
         
-        # O bloco entre o cabeçalho e o nome do militar
         bloco_intermediario = texto_completo[pos_cabecalho:pos_nome_inicio]
-        
-        # 2. Extrair o contexto e a Acção (Ex: ELEVAR, PROMOVER...)
         match_acao = regex_acao.search(bloco_intermediario)
         
         if match_acao:
             inicio_pos_acao = match_acao.end()
             texto_pos_acao = bloco_intermediario[inicio_pos_acao:]
             
-            # Padrão para detectar o início de uma lista/tabela de militares (ex: 1 CAD BM, ou MATRÍCULA)
             padrao_inicio_tabela = r"(?i)\n\s*(?:NOME|MATR[ÍI]CULA|ORDEM|ANEXO|\d+[\.\-]?\s+(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD|BM|PM)|(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\s+(?:BM|PM|QOBM|QABM)|\d{1,3}\s+-\s+[A-Z])"
-            
             match_tabela = re.search(padrao_inicio_tabela, texto_pos_acao)
             
-            # Se encontrar o início da tabela, a "Ação" é tudo o que está antes dela
             if match_tabela:
                 acao_texto = texto_pos_acao[:match_tabela.start()].strip()
             else:
                 acao_texto = texto_pos_acao.strip()
                 
-            # Junta o preâmbulo (até ao resolve) com a acção detectada
             contexto = bloco_intermediario[:inicio_pos_acao].strip() + "\n\n" + acao_texto
         else:
-            # Caso não haja "resolve" (ex: actos directos), limita os caracteres
             limite = min(600, len(bloco_intermediario))
             contexto = bloco_intermediario[:limite].strip() + ("\n[...]" if len(bloco_intermediario) > limite else "")
             
-        # 3. Extrair rigorosamente a linha do militar (Evitando militares anteriores)
+        # --- LÓGICA DE LIMPEZA CIRÚRGICA DA TABELA ---
         linhas_antes = texto_para_tras.split('\n')
         linhas_depois = texto_completo[pos_nome_inicio:].split('\n')
         
-        # Pega APENAS na linha em que o nome começou (cortando a lista acima)
-        linha_actual = linhas_antes[-1] + linhas_depois[0]
-        # Pega na linha seguinte (onde frequentemente a matrícula pode ser empurrada por quebra de página/coluna)
-        linha_seguinte = linhas_depois[1] if len(linhas_depois) > 1 else ""
+        # Junta a linha actual. Puxa a linha de baixo também, caso a matrícula tenha caído para a linha seguinte
+        linha_bruta = linhas_antes[-1] + linhas_depois[0]
+        if len(linhas_depois) > 1:
+            linha_bruta += " " + linhas_depois[1]
+            
+        match_nome_linha = re.search(nome_formatado, linha_bruta, re.IGNORECASE)
         
-        linha_dados = (linha_actual + "\n" + linha_seguinte).strip()
+        if match_nome_linha:
+            # A) Cortar o Lixo à Direita (Próximo militar colado)
+            pos_fim_nome = match_nome_linha.end()
+            texto_pos_nome = linha_bruta[pos_fim_nome:]
+            
+            # Procura a matrícula logo após o nome (Padrão MS: 509.116-021 ou 123456021)
+            match_matr = re.search(r"\d{2,3}\.?\d{3}-?\d{1,3}", texto_pos_nome)
+            if match_matr:
+                fim_dados = pos_fim_nome + match_matr.end()
+                linha_bruta = linha_bruta[:fim_dados] # Corta tudo o que vem depois da matrícula
+            else:
+                # Fallback: se não achar matrícula, corta na patente do próximo militar
+                padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
+                match_prox = re.search(padrao_patente, texto_pos_nome)
+                if match_prox:
+                    linha_bruta = linha_bruta[:pos_fim_nome + match_prox.start()]
+
+            # B) Cortar o Lixo à Esquerda (Militar anterior colado)
+            texto_pre_nome = linha_bruta[:match_nome_linha.start()]
+            padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
+            matches_patentes = list(re.finditer(padrao_patente, texto_pre_nome))
+            
+            if matches_patentes:
+                ultima_patente = matches_patentes[-1] # Pega estritamente a última patente encontrada antes do nome
+                linha_bruta = linha_bruta[ultima_patente.start():]
+                
+        linha_dados = linha_bruta.strip()
+        # ----------------------------------------------
         
         resultados.append({
             "cabecalho": cabecalho_texto,
@@ -94,7 +109,6 @@ def processar_publicacao(texto_completo, nome_busca):
             "linha_dados": linha_dados
         })
         
-    # Remover duplicados
     resultados_unicos = []
     chaves = set()
     for r in resultados:
@@ -144,7 +158,7 @@ def main():
                 
                 if texto_completo:
                     st.write(f"✅ Leitura concluída: {total_paginas} páginas processadas.")
-                    st.write("⚙️ A realizar pesquisa estruturada e cruzamento de dados...")
+                    st.write("⚙️ A realizar pesquisa estruturada e limpeza de tabelas...")
                     
                     atos_encontrados = processar_publicacao(texto_completo, nome_busca)
                     

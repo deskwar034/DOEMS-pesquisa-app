@@ -4,7 +4,8 @@ import io
 import requests
 import PyPDF2
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, date
+import zipfile
 
 st.set_page_config(page_title="Radar DOEMS Avançado", page_icon="🕵️‍♂️", layout="centered")
 
@@ -123,7 +124,6 @@ def processar_publicacao(texto_completo, nome_busca):
                 "linha_dados": linha_bruta.strip()
             })
         
-    # Remove resultados duplicados dentro do mesmo arquivo
     resultados_unicos = []
     chaves = set()
     for r in resultados:
@@ -135,7 +135,6 @@ def processar_publicacao(texto_completo, nome_busca):
     return resultados_unicos
 
 def formatar_data(data_iso):
-    """Converte '2025-08-15T07:30:00' para '15/08/2025'"""
     try:
         obj_data = datetime.strptime(data_iso.split('T')[0], '%Y-%m-%d')
         return obj_data.strftime('%d/%m/%Y')
@@ -144,20 +143,45 @@ def formatar_data(data_iso):
 
 def main():
     st.title("🕵️‍♂️ Radar DOEMS Automático")
-    st.markdown("Busca um nome na base de dados oficial do Estado, baixa todos os diários encontrados e gera um relatório estruturado.")
+    st.markdown("Busca um nome na base de dados oficial do Estado e gera relatórios otimizados para IA.")
     st.divider()
 
     st.subheader("Configuração da Busca")
     nome_busca = st.text_input("Nome completo para pesquisar (Ex: Geraldo Roberto Dias):")
     
-    if st.button("🔎 Buscar em todo o DOEMS", type="primary"):
+    # Configuração de Datas (Padrão: Hoje até 8 anos atrás)
+    hoje = date.today()
+    try:
+        oito_anos_atras = hoje.replace(year=hoje.year - 8)
+    except ValueError:
+        # Lida com o caso de 29 de fevereiro em anos bissextos
+        oito_anos_atras = hoje.replace(year=hoje.year - 8, day=28)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        data_inicial = st.date_input("Data Inicial", value=oito_anos_atras, format="DD/MM/YYYY")
+    with col2:
+        data_final = st.date_input("Data Final", value=hoje, format="DD/MM/YYYY")
+
+    # Validação de data
+    if data_inicial > data_final:
+        st.error("⚠️ A Data Inicial não pode ser posterior à Data Final.")
+        busca_valida = False
+    else:
+        busca_valida = True
+
+    if st.button("🔎 Buscar em todo o DOEMS", type="primary", disabled=not busca_valida):
         if not nome_busca:
             st.warning("Insira um nome válido para buscar.")
             return
 
-        # 1. Requisição para a API do DOEMS
+        # Converte as datas para o formato esperado pela API (YYYY-MM-DD)
+        data_ini_str = data_inicial.strftime("%Y-%m-%d")
+        data_fim_str = data_final.strftime("%Y-%m-%d")
+        
+        # Requisição para a API do DOEMS
         termo_url = urllib.parse.quote_plus(nome_busca.strip())
-        api_url = f"https://www.diariooficial.ms.gov.br/api/diarios/busca-diarios?tipo=1&texto={termo_url}&registrosPorPagina=500"
+        api_url = f"https://www.diariooficial.ms.gov.br/api/diarios/busca-diarios?tipo=1&texto={termo_url}&dataFinal={data_fim_str}&dataInicial={data_ini_str}&registrosPorPagina=500"
 
         with st.status("Consultando a base de dados do Governo...", expanded=True) as status:
             try:
@@ -174,10 +198,10 @@ def main():
             
             if total_registros == 0 or not paginas:
                 status.update(label="Nenhum registro encontrado.", state="complete", expanded=False)
-                st.info(f"O termo '{nome_busca}' não foi encontrado em nenhuma publicação.")
+                st.info(f"O termo '{nome_busca}' não foi encontrado no período de {data_inicial.strftime('%d/%m/%Y')} a {data_final.strftime('%d/%m/%Y')}.")
                 return
             
-            # 2. Desduplicação de arquivos (Baixar cada edição do DOEMS apenas 1 vez)
+            # Desduplicação de arquivos
             arquivos_unicos = {}
             for item in paginas:
                 link = item['caminhoArquivo']
@@ -191,29 +215,23 @@ def main():
             st.write(f"📊 Encontrados **{total_registros} ocorrências** distribuídas em **{len(arquivos_unicos)} edições** do Diário Oficial.")
             st.write("⏳ Iniciando download e análise estruturada (Isso pode demorar alguns minutos)...")
             
-            # Barra de progresso visual
             progress_bar = st.progress(0)
             contador = 0
             total_arquivos = len(arquivos_unicos)
             
             relatorio_final = []
 
-            # 3. Loop de Download e Extração
             for link_pdf, metadados in arquivos_unicos.items():
                 contador += 1
                 progress_bar.progress(contador / total_arquivos, text=f"Processando {contador}/{total_arquivos}: Edição {metadados['numero']}")
                 
                 try:
-                    # Baixa o PDF
                     pdf_resp = requests.get(link_pdf, timeout=30)
                     if pdf_resp.status_code == 200:
                         texto_completo, paginas_lidas = extract_text_from_pdf(pdf_resp.content)
                         
                         if texto_completo:
-                            # Passa a lógica híbrida
                             atos_extraidos = processar_publicacao(texto_completo, nome_busca)
-                            
-                            # Anexa metadados do Diário a cada ato encontrado
                             for ato in atos_extraidos:
                                 ato['do_numero'] = metadados['numero']
                                 ato['do_data'] = formatar_data(metadados['data'])
@@ -222,58 +240,70 @@ def main():
                 except Exception as e:
                     st.warning(f"Falha ao processar a edição {metadados['numero']}: {e}")
             
-            progress_bar.empty() # Remove a barra de progresso após finalizar
+            progress_bar.empty()
             status.update(label="Varredura concluída com sucesso!", state="complete", expanded=False)
 
-        # 4. Exibição dos Resultados e Exportação
+        # Exibição e Geração de Exportação Otimizada (ZIP + Lotes de 30)
         if relatorio_final:
             st.success(f"Extração finalizada! Foram estruturados **{len(relatorio_final)} atos**.")
             
-            texto_exportacao = [f"RELATÓRIO DE MONITORAMENTO: {nome_busca.upper()}", "="*50, ""]
+            # FATIAMENTO PARA INTELIGÊNCIA ARTIFICIAL (Máximo de 30 registros por arquivo)
+            TAMANHO_LOTE = 30
+            lotes = [relatorio_final[i:i + TAMANHO_LOTE] for i in range(0, len(relatorio_final), TAMANHO_LOTE)]
             
-            # Agrupa os resultados na tela e no TXT
+            # Criação do arquivo ZIP em memória
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                
+                for idx_lote, lote in enumerate(lotes, 1):
+                    texto_exportacao = [f"RELATÓRIO DE MONITORAMENTO: {nome_busca.upper()} - PARTE {idx_lote}", "="*50, ""]
+                    
+                    for i, ato in enumerate(lote, 1):
+                        numero_geral = (idx_lote - 1) * TAMANHO_LOTE + i
+                        
+                        # --- Montagem para o Arquivo TXT ---
+                        texto_exportacao.append(f"=== RESULTADO {numero_geral} | DOEMS {ato['do_numero']} ({ato['do_data']}) ===")
+                        texto_exportacao.append(f"[CABEÇALHO]\n{ato['cabecalho']}\n")
+                        if ato['tipo'] == "direto":
+                            texto_exportacao.append(f"[TEXTO COMPLETO]\n{ato['texto_integral']}\n\n")
+                        else:
+                            texto_exportacao.append(f"[CONTEXTO]\n{ato['contexto']}\n")
+                            texto_exportacao.append(f"[DADOS TABELA]\n{ato['linha_dados']}\n\n")
+                    
+                    # Salva este lote como um TXT dentro do ZIP
+                    txt_conteudo = "\n".join(texto_exportacao).encode('utf-8')
+                    nome_arquivo = f"dossie_{nome_busca.replace(' ', '_')}_parte_{idx_lote}.txt"
+                    zip_file.writestr(nome_arquivo, txt_conteudo)
+
+            # --- Exibição na Tela (mantém a visualização intuitiva para o usuário) ---
             for i, ato in enumerate(relatorio_final, 1):
                 titulo_expander = f"📖 DOEMS nº {ato['do_numero']} ({ato['do_data']}) - {ato['cabecalho'][:40]}..."
-                
                 with st.expander(titulo_expander, expanded=False):
                     st.markdown(f"**Data de Publicação:** {ato['do_data']}")
                     st.markdown("**[PORTARIA E DADOS]**")
                     st.info(ato['cabecalho'])
-                    
                     if ato['tipo'] == "direto":
                         st.markdown("**[TEXTO COMPLETO DO ATO INDIVIDUAL]**")
                         st.write(ato['texto_integral'])
-                        
-                        # TXT Format
-                        texto_exportacao.append(f"=== RESULTADO {i} | DOEMS {ato['do_numero']} ({ato['do_data']}) ===")
-                        texto_exportacao.append(f"[CABEÇALHO]\n{ato['cabecalho']}\n")
-                        texto_exportacao.append(f"[TEXTO COMPLETO]\n{ato['texto_integral']}\n\n")
                     else:
                         st.markdown("**[CONTEXTO DA AÇÃO]**")
                         st.write(ato['contexto'])
-                        
                         st.markdown("**[NOME E DADOS DA TABELA]**")
                         st.code(ato['linha_dados'], language="text")
-                        
-                        # TXT Format
-                        texto_exportacao.append(f"=== RESULTADO {i} | DOEMS {ato['do_numero']} ({ato['do_data']}) ===")
-                        texto_exportacao.append(f"[CABEÇALHO]\n{ato['cabecalho']}\n")
-                        texto_exportacao.append(f"[CONTEXTO]\n{ato['contexto']}\n")
-                        texto_exportacao.append(f"[DADOS TABELA]\n{ato['linha_dados']}\n\n")
-            
-            txt_final = "\n".join(texto_exportacao).encode('utf-8')
             
             st.divider()
+            
+            # Botão de Download disponibilizando o arquivo .ZIP gerado
             st.download_button(
-                label="📥 Descarregar Relatório Completo (TXT)",
-                data=txt_final,
-                file_name=f"dossie_{nome_busca.replace(' ', '_')}.txt",
-                mime="text/plain",
+                label=f"📥 Baixar Relatórios Fatiados para IA (.ZIP com {len(lotes)} arquivos)",
+                data=zip_buffer.getvalue(),
+                file_name=f"dossies_IA_{nome_busca.replace(' ', '_')}.zip",
+                mime="application/zip",
                 type="primary",
                 use_container_width=True
             )
         else:
-            st.warning("O robô baixou os Diários, mas não conseguiu extrair os atos formatados. O nome pode estar em anexos ou imagens não legíveis.")
+            st.warning("O robô baixou os Diários, mas não conseguiu extrair os atos formatados.")
 
 if __name__ == "__main__":
     main()

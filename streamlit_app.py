@@ -3,11 +3,13 @@ import re
 import io
 import requests
 import PyPDF2
+import urllib.parse
+from datetime import datetime
 
-st.set_page_config(page_title="Monitorização DOEMS", page_icon="🔍", layout="centered")
+st.set_page_config(page_title="Radar DOEMS Avançado", page_icon="🕵️‍♂️", layout="centered")
 
-@st.cache_data
 def extract_text_from_pdf(file_bytes):
+    """Extrai todo o texto do PDF sem usar cache para evitar estouro de memória no processamento em lote."""
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
         text = ""
@@ -21,10 +23,10 @@ def extract_text_from_pdf(file_bytes):
         return None, str(e)
 
 def processar_publicacao(texto_completo, nome_busca):
+    """Lógica Híbrida de Extração: Isola a publicação e define se é Ato Direto ou Tabela."""
     nome_formatado = r"\s+".join(nome_busca.strip().split())
     regex_nome = re.compile(nome_formatado, re.IGNORECASE)
     
-    # 1. Mapeia os limites (fronteiras) de todos os atos no documento
     regex_cabecalho = re.compile(r"(?i)(?:^|\n)\s*(PORTARIA|DECRETO|RESOLUÇÃO|EDITAL|ATO|EXTRATO|INSTRUÇÃO)[^\n]+")
     cabecalhos = [(m.start(), m.group().strip()) for m in regex_cabecalho.finditer(texto_completo)]
 
@@ -33,7 +35,6 @@ def processar_publicacao(texto_completo, nome_busca):
     for match_nome in regex_nome.finditer(texto_completo):
         pos_nome = match_nome.start()
         
-        # 2. Isola o bloco exato onde o nome está (do Cabeçalho atual até o próximo)
         cabecalho_atual = None
         pos_inicio_ato = 0
         pos_fim_ato = len(texto_completo)
@@ -50,22 +51,17 @@ def processar_publicacao(texto_completo, nome_busca):
         if not cabecalho_atual:
             continue
             
-        # Extrai o texto completo do ato (Cabeçalho + Corpo + Assinatura)
         ato_completo = texto_completo[pos_inicio_ato:pos_fim_ato].strip()
         
-        # 3. ESTRATÉGIA HÍBRIDA (Atos Individuais vs Atos em Massa/Tabelas)
-        # 3500 caracteres equivale a aprox. 1 página inteira de texto. 
-        # Atos diretos são curtos. Tabelas de promoção são gigantes.
-        
         if len(ato_completo) < 3500:
-            # TIPO A: Ato Direto (Não aplicamos cortes de tabela para não perder contexto)
+            # TIPO A: Ato Direto
             resultados.append({
                 "tipo": "direto",
                 "cabecalho": cabecalho_atual,
                 "texto_integral": ato_completo
             })
         else:
-            # TIPO B: Ato em Massa / Tabela (Isolamos a ação e cortamos lixo da tabela)
+            # TIPO B: Ato em Massa / Tabela
             regex_acao = re.compile(r"(?i)(RESOLVE|RESOLVEM|DECIDE|DECRETA|TORNA PÚBLICO|CONVOCA|DESIGNAR|NOMEAR|EXONERAR|AUTORIZAR|CERTIFICA)[^\n]*?(?::|;|\n|$)")
             match_acao = regex_acao.search(ato_completo)
             
@@ -88,7 +84,7 @@ def processar_publicacao(texto_completo, nome_busca):
             else:
                 contexto = ato_completo[:min(600, pos_nome_no_ato)].strip() + "\n[...]"
                 
-            # Limpeza Cirúrgica (Corta matrículas e patentes de outros militares na tabela)
+            # Limpeza Cirúrgica de Tabela
             linhas = ato_completo.split('\n')
             linha_idx = 0
             for idx, l in enumerate(linhas):
@@ -127,7 +123,7 @@ def processar_publicacao(texto_completo, nome_busca):
                 "linha_dados": linha_bruta.strip()
             })
         
-    # Remove resultados duplicados
+    # Remove resultados duplicados dentro do mesmo arquivo
     resultados_unicos = []
     chaves = set()
     for r in resultados:
@@ -138,91 +134,146 @@ def processar_publicacao(texto_completo, nome_busca):
             
     return resultados_unicos
 
+def formatar_data(data_iso):
+    """Converte '2025-08-15T07:30:00' para '15/08/2025'"""
+    try:
+        obj_data = datetime.strptime(data_iso.split('T')[0], '%Y-%m-%d')
+        return obj_data.strftime('%d/%m/%Y')
+    except:
+        return data_iso
+
 def main():
-    st.title("🔍 Monitorização DOEMS Avançada")
-    st.markdown("Identifica e adapta a extração automaticamente para Atos em Massa (Tabelas) ou Atos Individuais (Corridos).")
+    st.title("🕵️‍♂️ Radar DOEMS Automático")
+    st.markdown("Busca um nome na base de dados oficial do Estado, baixa todos os diários encontrados e gera um relatório estruturado.")
     st.divider()
 
-    fonte = st.radio("Escolha a origem do PDF:", ("Carregar Ficheiro", "Ligação da Web (Link)"))
-    pdf_bytes = None
+    st.subheader("Configuração da Busca")
+    nome_busca = st.text_input("Nome completo para pesquisar (Ex: Geraldo Roberto Dias):")
+    
+    if st.button("🔎 Buscar em todo o DOEMS", type="primary"):
+        if not nome_busca:
+            st.warning("Insira um nome válido para buscar.")
+            return
 
-    if fonte == "Carregar Ficheiro":
-        arquivo_upado = st.file_uploader("Seleccione o ficheiro PDF", type=["pdf"])
-        if arquivo_upado:
-            pdf_bytes = arquivo_upado.read()
-    else:
-        url_pdf = st.text_input("Insira o link directo para o PDF:")
-        if url_pdf and st.button("Descarregar PDF"):
-            with st.status("A descarregar ficheiro...", expanded=True) as status:
-                try:
-                    response = requests.get(url_pdf, timeout=15)
-                    response.raise_for_status()
-                    pdf_bytes = response.content
-                    status.update(label="PDF descarregado com sucesso!", state="complete", expanded=False)
-                except requests.exceptions.RequestException as e:
-                    status.update(label=f"Erro: {e}", state="error", expanded=True)
+        # 1. Requisição para a API do DOEMS
+        termo_url = urllib.parse.quote_plus(nome_busca.strip())
+        api_url = f"https://www.diariooficial.ms.gov.br/api/diarios/busca-diarios?tipo=1&texto={termo_url}&registrosPorPagina=500"
 
-    if pdf_bytes:
-        st.subheader("Configuração da Pesquisa")
-        nome_busca = st.text_input("Nome do servidor/militar a pesquisar:", value="Geraldo Roberto Dias")
-        
-        if st.button("Pesquisar Publicações", type="primary"):
-            if not nome_busca:
-                st.warning("Insira um nome válido.")
+        with st.status("Consultando a base de dados do Governo...", expanded=True) as status:
+            try:
+                response = requests.get(api_url, timeout=15)
+                response.raise_for_status()
+                dados_api = response.json()
+            except Exception as e:
+                status.update(label="Erro ao conectar na API do DOEMS.", state="error", expanded=True)
+                st.error(str(e))
                 return
+            
+            paginas = dados_api.get('paginasDiario', [])
+            total_registros = dados_api.get('totalDeRegistros', 0)
+            
+            if total_registros == 0 or not paginas:
+                status.update(label="Nenhum registro encontrado.", state="complete", expanded=False)
+                st.info(f"O termo '{nome_busca}' não foi encontrado em nenhuma publicação.")
+                return
+            
+            # 2. Desduplicação de arquivos (Baixar cada edição do DOEMS apenas 1 vez)
+            arquivos_unicos = {}
+            for item in paginas:
+                link = item['caminhoArquivo']
+                if link not in arquivos_unicos:
+                    arquivos_unicos[link] = {
+                        'numero': item['numero'],
+                        'data': item['dataPublicacao'],
+                        'descricao': item['descricao']
+                    }
+            
+            st.write(f"📊 Encontrados **{total_registros} ocorrências** distribuídas em **{len(arquivos_unicos)} edições** do Diário Oficial.")
+            st.write("⏳ Iniciando download e análise estruturada (Isso pode demorar alguns minutos)...")
+            
+            # Barra de progresso visual
+            progress_bar = st.progress(0)
+            contador = 0
+            total_arquivos = len(arquivos_unicos)
+            
+            relatorio_final = []
 
-            with st.status("A processar documento...", expanded=True) as status:
-                st.write("📄 A extrair texto...")
-                texto_completo, total_paginas = extract_text_from_pdf(pdf_bytes)
+            # 3. Loop de Download e Extração
+            for link_pdf, metadados in arquivos_unicos.items():
+                contador += 1
+                progress_bar.progress(contador / total_arquivos, text=f"Processando {contador}/{total_arquivos}: Edição {metadados['numero']}")
                 
-                if texto_completo:
-                    st.write(f"✅ Leitura concluída: {total_paginas} páginas processadas.")
-                    st.write("⚙️ Analisando inteligência de blocos e formatando resultados...")
+                try:
+                    # Baixa o PDF
+                    pdf_resp = requests.get(link_pdf, timeout=30)
+                    if pdf_resp.status_code == 200:
+                        texto_completo, paginas_lidas = extract_text_from_pdf(pdf_resp.content)
+                        
+                        if texto_completo:
+                            # Passa a lógica híbrida
+                            atos_extraidos = processar_publicacao(texto_completo, nome_busca)
+                            
+                            # Anexa metadados do Diário a cada ato encontrado
+                            for ato in atos_extraidos:
+                                ato['do_numero'] = metadados['numero']
+                                ato['do_data'] = formatar_data(metadados['data'])
+                                ato['do_desc'] = metadados['descricao']
+                                relatorio_final.append(ato)
+                except Exception as e:
+                    st.warning(f"Falha ao processar a edição {metadados['numero']}: {e}")
+            
+            progress_bar.empty() # Remove a barra de progresso após finalizar
+            status.update(label="Varredura concluída com sucesso!", state="complete", expanded=False)
+
+        # 4. Exibição dos Resultados e Exportação
+        if relatorio_final:
+            st.success(f"Extração finalizada! Foram estruturados **{len(relatorio_final)} atos**.")
+            
+            texto_exportacao = [f"RELATÓRIO DE MONITORAMENTO: {nome_busca.upper()}", "="*50, ""]
+            
+            # Agrupa os resultados na tela e no TXT
+            for i, ato in enumerate(relatorio_final, 1):
+                titulo_expander = f"📖 DOEMS nº {ato['do_numero']} ({ato['do_data']}) - {ato['cabecalho'][:40]}..."
+                
+                with st.expander(titulo_expander, expanded=False):
+                    st.markdown(f"**Data de Publicação:** {ato['do_data']}")
+                    st.markdown("**[PORTARIA E DADOS]**")
+                    st.info(ato['cabecalho'])
                     
-                    atos_encontrados = processar_publicacao(texto_completo, nome_busca)
-                    
-                    if atos_encontrados:
-                        status.update(label=f"Sucesso! Encontrado(s) {len(atos_encontrados)} ato(s).", state="complete", expanded=False)
+                    if ato['tipo'] == "direto":
+                        st.markdown("**[TEXTO COMPLETO DO ATO INDIVIDUAL]**")
+                        st.write(ato['texto_integral'])
                         
-                        texto_exportacao = []
-                        
-                        for i, ato in enumerate(atos_encontrados, 1):
-                            with st.expander(f"📄 Resultado {i} - {ato['cabecalho'][:50]}...", expanded=True):
-                                st.markdown("**[PORTARIA E DADOS]**")
-                                st.info(ato['cabecalho'])
-                                
-                                # EXIBIÇÃO DINÂMICA BASEADA NO TIPO DE ATO
-                                if ato['tipo'] == "direto":
-                                    st.markdown("**[TEXTO COMPLETO DO ATO INDIVIDUAL]**")
-                                    st.write(ato['texto_integral'])
-                                    
-                                    texto_exportacao.append(
-                                        f"=== RESULTADO {i} ===\n[CABEÇALHO]\n{ato['cabecalho']}\n\n[TEXTO COMPLETO DO ATO]\n{ato['texto_integral']}\n"
-                                    )
-                                else:
-                                    st.markdown("**[CONTEXTO DA AÇÃO]**")
-                                    st.write(ato['contexto'])
-                                    
-                                    st.markdown("**[NOME E DADOS DA TABELA]**")
-                                    st.code(ato['linha_dados'], language="text")
-                                    
-                                    texto_exportacao.append(
-                                        f"=== RESULTADO {i} ===\n[CABEÇALHO]\n{ato['cabecalho']}\n\n[CONTEXTO]\n{ato['contexto']}\n\n[DADOS TABELA]\n{ato['linha_dados']}\n"
-                                    )
-                        
-                        txt_final = "\n\n".join(texto_exportacao).encode('utf-8')
-                        st.download_button(
-                            label="📥 Descarregar resultados (TXT)",
-                            data=txt_final,
-                            file_name=f"extracao_{nome_busca.replace(' ', '_')}.txt",
-                            mime="text/plain",
-                        )
+                        # TXT Format
+                        texto_exportacao.append(f"=== RESULTADO {i} | DOEMS {ato['do_numero']} ({ato['do_data']}) ===")
+                        texto_exportacao.append(f"[CABEÇALHO]\n{ato['cabecalho']}\n")
+                        texto_exportacao.append(f"[TEXTO COMPLETO]\n{ato['texto_integral']}\n\n")
                     else:
-                        st.write("⚠️ O nome não foi encontrado em nenhum acto formal neste documento.")
-                        status.update(label="Pesquisa finalizada (sem resultados)", state="complete", expanded=True)
-                else:
-                    st.write("❌ Falha na leitura do PDF.")
-                    status.update(label="Erro no processamento", state="error", expanded=True)
+                        st.markdown("**[CONTEXTO DA AÇÃO]**")
+                        st.write(ato['contexto'])
+                        
+                        st.markdown("**[NOME E DADOS DA TABELA]**")
+                        st.code(ato['linha_dados'], language="text")
+                        
+                        # TXT Format
+                        texto_exportacao.append(f"=== RESULTADO {i} | DOEMS {ato['do_numero']} ({ato['do_data']}) ===")
+                        texto_exportacao.append(f"[CABEÇALHO]\n{ato['cabecalho']}\n")
+                        texto_exportacao.append(f"[CONTEXTO]\n{ato['contexto']}\n")
+                        texto_exportacao.append(f"[DADOS TABELA]\n{ato['linha_dados']}\n\n")
+            
+            txt_final = "\n".join(texto_exportacao).encode('utf-8')
+            
+            st.divider()
+            st.download_button(
+                label="📥 Descarregar Relatório Completo (TXT)",
+                data=txt_final,
+                file_name=f"dossie_{nome_busca.replace(' ', '_')}.txt",
+                mime="text/plain",
+                type="primary",
+                use_container_width=True
+            )
+        else:
+            st.warning("O robô baixou os Diários, mas não conseguiu extrair os atos formatados. O nome pode estar em anexos ou imagens não legíveis.")
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,6 @@ import io
 import requests
 import PyPDF2
 
-# Configuração da página
 st.set_page_config(page_title="Monitorização DOEMS", page_icon="🔍", layout="centered")
 
 @st.cache_data
@@ -25,94 +24,114 @@ def processar_publicacao(texto_completo, nome_busca):
     nome_formatado = r"\s+".join(nome_busca.strip().split())
     regex_nome = re.compile(nome_formatado, re.IGNORECASE)
     
-    regex_cabecalho = re.compile(r"(?i)(?:^|\n)\s*(PORTARIA|DECRETO|RESOLUÇÃO|EDITAL|ATO|EXTRATO)[^\n]+")
-    regex_acao = re.compile(r"(?i)(RESOLVE|RESOLVEM|DECIDE|DECRETA|TORNA PÚBLICO|CONVOCA|DESIGNAR|NOMEAR|EXONERAR|AUTORIZAR|CERTIFICA)[^\n]*?(?::|;|\n|$)")
+    # 1. Mapeia os limites (fronteiras) de todos os atos no documento
+    regex_cabecalho = re.compile(r"(?i)(?:^|\n)\s*(PORTARIA|DECRETO|RESOLUÇÃO|EDITAL|ATO|EXTRATO|INSTRUÇÃO)[^\n]+")
+    cabecalhos = [(m.start(), m.group().strip()) for m in regex_cabecalho.finditer(texto_completo)]
 
     resultados = []
     
     for match_nome in regex_nome.finditer(texto_completo):
-        pos_nome_inicio = match_nome.start()
+        pos_nome = match_nome.start()
         
-        texto_para_tras = texto_completo[:pos_nome_inicio]
-        cabecalhos = list(regex_cabecalho.finditer(texto_para_tras))
+        # 2. Isola o bloco exato onde o nome está (do Cabeçalho atual até o próximo)
+        cabecalho_atual = None
+        pos_inicio_ato = 0
+        pos_fim_ato = len(texto_completo)
         
-        if not cabecalhos:
+        for i, (pos_cab, texto_cab) in enumerate(cabecalhos):
+            if pos_cab <= pos_nome:
+                cabecalho_atual = texto_cab
+                pos_inicio_ato = pos_cab
+                if i + 1 < len(cabecalhos):
+                    pos_fim_ato = cabecalhos[i+1][0]
+            else:
+                break
+                
+        if not cabecalho_atual:
             continue
             
-        ultimo_cabecalho = cabecalhos[-1]
-        cabecalho_texto = ultimo_cabecalho.group().strip()
-        pos_cabecalho = ultimo_cabecalho.start()
+        # Extrai o texto completo do ato (Cabeçalho + Corpo + Assinatura)
+        ato_completo = texto_completo[pos_inicio_ato:pos_fim_ato].strip()
         
-        bloco_intermediario = texto_completo[pos_cabecalho:pos_nome_inicio]
-        match_acao = regex_acao.search(bloco_intermediario)
+        # 3. ESTRATÉGIA HÍBRIDA (Atos Individuais vs Atos em Massa/Tabelas)
+        # 3500 caracteres equivale a aprox. 1 página inteira de texto. 
+        # Atos diretos são curtos. Tabelas de promoção são gigantes.
         
-        if match_acao:
-            inicio_pos_acao = match_acao.end()
-            texto_pos_acao = bloco_intermediario[inicio_pos_acao:]
-            
-            padrao_inicio_tabela = r"(?i)\n\s*(?:NOME|MATR[ÍI]CULA|ORDEM|ANEXO|\d+[\.\-]?\s+(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD|BM|PM)|(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\s+(?:BM|PM|QOBM|QABM)|\d{1,3}\s+-\s+[A-Z])"
-            match_tabela = re.search(padrao_inicio_tabela, texto_pos_acao)
-            
-            if match_tabela:
-                acao_texto = texto_pos_acao[:match_tabela.start()].strip()
-            else:
-                acao_texto = texto_pos_acao.strip()
-                
-            contexto = bloco_intermediario[:inicio_pos_acao].strip() + "\n\n" + acao_texto
+        if len(ato_completo) < 3500:
+            # TIPO A: Ato Direto (Não aplicamos cortes de tabela para não perder contexto)
+            resultados.append({
+                "tipo": "direto",
+                "cabecalho": cabecalho_atual,
+                "texto_integral": ato_completo
+            })
         else:
-            limite = min(600, len(bloco_intermediario))
-            contexto = bloco_intermediario[:limite].strip() + ("\n[...]" if len(bloco_intermediario) > limite else "")
+            # TIPO B: Ato em Massa / Tabela (Isolamos a ação e cortamos lixo da tabela)
+            regex_acao = re.compile(r"(?i)(RESOLVE|RESOLVEM|DECIDE|DECRETA|TORNA PÚBLICO|CONVOCA|DESIGNAR|NOMEAR|EXONERAR|AUTORIZAR|CERTIFICA)[^\n]*?(?::|;|\n|$)")
+            match_acao = regex_acao.search(ato_completo)
             
-        # --- LÓGICA DE LIMPEZA CIRÚRGICA DA TABELA ---
-        linhas_antes = texto_para_tras.split('\n')
-        linhas_depois = texto_completo[pos_nome_inicio:].split('\n')
-        
-        # Junta a linha actual. Puxa a linha de baixo também, caso a matrícula tenha caído para a linha seguinte
-        linha_bruta = linhas_antes[-1] + linhas_depois[0]
-        if len(linhas_depois) > 1:
-            linha_bruta += " " + linhas_depois[1]
+            match_nome_ato = re.search(nome_formatado, ato_completo, re.IGNORECASE)
+            pos_nome_no_ato = match_nome_ato.start() if match_nome_ato else len(ato_completo)
             
-        match_nome_linha = re.search(nome_formatado, linha_bruta, re.IGNORECASE)
-        
-        if match_nome_linha:
-            # A) Cortar o Lixo à Direita (Próximo militar colado)
-            pos_fim_nome = match_nome_linha.end()
-            texto_pos_nome = linha_bruta[pos_fim_nome:]
-            
-            # Procura a matrícula logo após o nome (Padrão MS: 509.116-021 ou 123456021)
-            match_matr = re.search(r"\d{2,3}\.?\d{3}-?\d{1,3}", texto_pos_nome)
-            if match_matr:
-                fim_dados = pos_fim_nome + match_matr.end()
-                linha_bruta = linha_bruta[:fim_dados] # Corta tudo o que vem depois da matrícula
-            else:
-                # Fallback: se não achar matrícula, corta na patente do próximo militar
-                padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
-                match_prox = re.search(padrao_patente, texto_pos_nome)
-                if match_prox:
-                    linha_bruta = linha_bruta[:pos_fim_nome + match_prox.start()]
-
-            # B) Cortar o Lixo à Esquerda (Militar anterior colado)
-            texto_pre_nome = linha_bruta[:match_nome_linha.start()]
-            padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
-            matches_patentes = list(re.finditer(padrao_patente, texto_pre_nome))
-            
-            if matches_patentes:
-                ultima_patente = matches_patentes[-1] # Pega estritamente a última patente encontrada antes do nome
-                linha_bruta = linha_bruta[ultima_patente.start():]
+            if match_acao:
+                inicio_pos_acao = match_acao.end()
+                texto_pos_acao = ato_completo[inicio_pos_acao:pos_nome_no_ato]
                 
-        linha_dados = linha_bruta.strip()
-        # ----------------------------------------------
+                padrao_inicio_tabela = r"(?i)\n\s*(?:NOME|MATR[ÍI]CULA|ORDEM|ANEXO|\d+[\.\-]?\s+(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD|BM|PM)|(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\s+(?:BM|PM|QOBM|QABM)|\d{1,3}\s+-\s+[A-Z])"
+                match_tabela = re.search(padrao_inicio_tabela, texto_pos_acao)
+                
+                if match_tabela:
+                    acao_texto = texto_pos_acao[:match_tabela.start()].strip()
+                else:
+                    acao_texto = texto_pos_acao.strip()
+                    
+                contexto = ato_completo[:inicio_pos_acao].strip() + "\n\n" + acao_texto
+            else:
+                contexto = ato_completo[:min(600, pos_nome_no_ato)].strip() + "\n[...]"
+                
+            # Limpeza Cirúrgica (Corta matrículas e patentes de outros militares na tabela)
+            linhas = ato_completo.split('\n')
+            linha_idx = 0
+            for idx, l in enumerate(linhas):
+                if re.search(nome_formatado, l, re.IGNORECASE):
+                    linha_idx = idx
+                    break
+                    
+            linha_bruta = linhas[linha_idx]
+            if linha_idx + 1 < len(linhas):
+                linha_bruta += " " + linhas[linha_idx + 1]
+                
+            match_nome_linha = re.search(nome_formatado, linha_bruta, re.IGNORECASE)
+            if match_nome_linha:
+                pos_fim_nome = match_nome_linha.end()
+                texto_pos_nome = linha_bruta[pos_fim_nome:]
+                match_matr = re.search(r"\d{2,3}\.?\d{3}-?\d{1,3}", texto_pos_nome)
+                if match_matr:
+                    linha_bruta = linha_bruta[:pos_fim_nome + match_matr.end()]
+                else:
+                    padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
+                    match_prox = re.search(padrao_patente, texto_pos_nome)
+                    if match_prox:
+                        linha_bruta = linha_bruta[:pos_fim_nome + match_prox.start()]
+
+                texto_pre_nome = linha_bruta[:match_nome_linha.start()]
+                padrao_patente = r"(?i)(?:\d+[\.\-ºª]?\s+)?(?:CEL|TC|MAJ|CAP|TEN|ASP|CAD|AL|SUBTEN|SGT|CB|SD)\b"
+                matches_patentes = list(re.finditer(padrao_patente, texto_pre_nome))
+                if matches_patentes:
+                    ultima_patente = matches_patentes[-1]
+                    linha_bruta = linha_bruta[ultima_patente.start():]
+                    
+            resultados.append({
+                "tipo": "tabela",
+                "cabecalho": cabecalho_atual,
+                "contexto": contexto.strip(),
+                "linha_dados": linha_bruta.strip()
+            })
         
-        resultados.append({
-            "cabecalho": cabecalho_texto,
-            "contexto": contexto.strip(),
-            "linha_dados": linha_dados
-        })
-        
+    # Remove resultados duplicados
     resultados_unicos = []
     chaves = set()
     for r in resultados:
-        chave = r["cabecalho"] + r["linha_dados"]
+        chave = r["cabecalho"] + (r.get("linha_dados", "") or r.get("texto_integral", ""))
         if chave not in chaves:
             chaves.add(chave)
             resultados_unicos.append(r)
@@ -121,7 +140,7 @@ def processar_publicacao(texto_completo, nome_busca):
 
 def main():
     st.title("🔍 Monitorização DOEMS Avançada")
-    st.markdown("Extracção estruturada de actos por Cabeçalho, Contexto da Acção e Registo do Servidor.")
+    st.markdown("Identifica e adapta a extração automaticamente para Atos em Massa (Tabelas) ou Atos Individuais (Corridos).")
     st.divider()
 
     fonte = st.radio("Escolha a origem do PDF:", ("Carregar Ficheiro", "Ligação da Web (Link)"))
@@ -153,17 +172,17 @@ def main():
                 return
 
             with st.status("A processar documento...", expanded=True) as status:
-                st.write("📄 A extrair texto (este processo pode demorar alguns segundos)...")
+                st.write("📄 A extrair texto...")
                 texto_completo, total_paginas = extract_text_from_pdf(pdf_bytes)
                 
                 if texto_completo:
                     st.write(f"✅ Leitura concluída: {total_paginas} páginas processadas.")
-                    st.write("⚙️ A realizar pesquisa estruturada e limpeza de tabelas...")
+                    st.write("⚙️ Analisando inteligência de blocos e formatando resultados...")
                     
                     atos_encontrados = processar_publicacao(texto_completo, nome_busca)
                     
                     if atos_encontrados:
-                        status.update(label=f"Sucesso! Encontrado(s) {len(atos_encontrados)} registo(s).", state="complete", expanded=False)
+                        status.update(label=f"Sucesso! Encontrado(s) {len(atos_encontrados)} ato(s).", state="complete", expanded=False)
                         
                         texto_exportacao = []
                         
@@ -172,18 +191,24 @@ def main():
                                 st.markdown("**[PORTARIA E DADOS]**")
                                 st.info(ato['cabecalho'])
                                 
-                                st.markdown("**[CONTEXTO COMPLETO]**")
-                                st.write(ato['contexto'])
-                                
-                                st.markdown("**[NOME E DADOS DA TABELA]**")
-                                st.code(ato['linha_dados'], language="text")
-                            
-                            texto_exportacao.append(
-                                f"=== RESULTADO {i} ===\n"
-                                f"[CABEÇALHO]\n{ato['cabecalho']}\n\n"
-                                f"[CONTEXTO]\n{ato['contexto']}\n\n"
-                                f"[DADOS TABELA]\n{ato['linha_dados']}\n"
-                            )
+                                # EXIBIÇÃO DINÂMICA BASEADA NO TIPO DE ATO
+                                if ato['tipo'] == "direto":
+                                    st.markdown("**[TEXTO COMPLETO DO ATO INDIVIDUAL]**")
+                                    st.write(ato['texto_integral'])
+                                    
+                                    texto_exportacao.append(
+                                        f"=== RESULTADO {i} ===\n[CABEÇALHO]\n{ato['cabecalho']}\n\n[TEXTO COMPLETO DO ATO]\n{ato['texto_integral']}\n"
+                                    )
+                                else:
+                                    st.markdown("**[CONTEXTO DA AÇÃO]**")
+                                    st.write(ato['contexto'])
+                                    
+                                    st.markdown("**[NOME E DADOS DA TABELA]**")
+                                    st.code(ato['linha_dados'], language="text")
+                                    
+                                    texto_exportacao.append(
+                                        f"=== RESULTADO {i} ===\n[CABEÇALHO]\n{ato['cabecalho']}\n\n[CONTEXTO]\n{ato['contexto']}\n\n[DADOS TABELA]\n{ato['linha_dados']}\n"
+                                    )
                         
                         txt_final = "\n\n".join(texto_exportacao).encode('utf-8')
                         st.download_button(
